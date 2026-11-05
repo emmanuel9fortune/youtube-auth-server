@@ -4,8 +4,8 @@ const mediaSchema = new mongoose.Schema({
   title: { type: String, required: true, trim: true, maxlength: 180 },
   description: { type: String, default: '', maxlength: 5000 },
   resourceType: { type: String, enum: ['image', 'video'], required: true },
-  cloudinaryPublicId: { type: String, required: true },
-  secureUrl: { type: String, required: true },
+  cloudinaryPublicId: { type: String, default: null },
+  secureUrl: { type: String, default: null },
   format: { type: String, default: '' },
   bytes: { type: Number, default: 0 },
   duration: { type: Number, default: null },
@@ -13,6 +13,10 @@ const mediaSchema = new mongoose.Schema({
   scheduledAt: { type: Date, default: null },
   youtubeVideoId: { type: String, default: '' },
   youtubeUrl: { type: String, default: '' },
+  cloudinaryDeleted: {
+    type: Boolean,
+    default: false
+  },
   lastError: { type: String, default: '' }
 }, { timestamps: true });
 

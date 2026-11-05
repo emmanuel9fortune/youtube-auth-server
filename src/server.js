@@ -35,6 +35,15 @@ function requirePassword(req, res, next) {
   next();
 }
 
+async function start() {
+  if (!process.env.MONGODB_URI) throw new Error('MONGODB_URI is missing. Copy .env.example to .env and configure it.');
+  await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 15000 });
+  console.log('Connected to MongoDB');
+  app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
+}
+
+start().catch(error => { console.error('Startup failed:', error.message); process.exit(1); });
+
 function oauthClient() {
   const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI } = process.env;
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REDIRECT_URI) {
@@ -114,7 +123,11 @@ app.delete('/api/media/:id', async (req, res) => {
     const item = await Media.findById(req.params.id);
     if (!item) return res.status(404).json({ error: 'Media not found.' });
     // Remove the cloud asset as well as the database record.
-    await cloudinary.uploader.destroy(item.cloudinaryPublicId, { resource_type: item.resourceType === 'video' ? 'video' : 'image', invalidate: true });
+    await cloudinary.uploader.destroy(
+      item.cloudinaryPublicId, { 
+        resource_type: item.resourceType === 'video' ? 'video' : 'image', 
+        invalidate: true 
+    });
     await item.deleteOne();
     res.json({ ok: true });
   } catch (error) { res.status(500).json({ error: error.message }); }
@@ -164,70 +177,144 @@ app.get('/api/youtube/callback', async (req, res) => {
 app.post('/api/media/:id/schedule', async (req, res) => {
   try {
     const item = await Media.findById(req.params.id);
-    if (!item) return res.status(404).json({ error: 'Media not found.' });
-    if (item.resourceType !== 'video') return res.status(400).json({ error: 'Only video files can be scheduled on YouTube.' });
-    if (item.youtubeVideoId) return res.status(400).json({ error: 'This media item has already been uploaded to YouTube.' });
+
+    if (!item) {
+      return res.status(404).json({ error: 'Media not found.' });
+    }
+
+    if (item.resourceType !== 'video') {
+      return res.status(400).json({
+        error: 'Only video files can be scheduled on YouTube.'
+      });
+    }
+
+    if (item.youtubeVideoId) {
+      return res.status(400).json({
+        error: 'This video has already been uploaded to YouTube.'
+      });
+    }
+
     const publishAt = new Date(req.body.publishAt);
-    if (!req.body.publishAt || Number.isNaN(publishAt.getTime())) return res.status(400).json({ error: 'Choose a valid publishing date and time.' });
-    if (publishAt.getTime() < Date.now() + 15 * 60 * 1000) return res.status(400).json({ error: 'Choose a publishing time at least 15 minutes in the future.' });
+
+    if (!req.body.publishAt || Number.isNaN(publishAt.getTime())) {
+      return res.status(400).json({
+        error: 'Choose a valid publishing date and time.'
+      });
+    }
+
+    if (publishAt.getTime() < Date.now() + 15 * 60 * 1000) {
+      return res.status(400).json({
+        error: 'Choose a time at least 15 minutes in the future.'
+      });
+    }
 
     const { youtube } = await getAuthorizedYoutube();
-    // Cloudinary returns a public HTTPS asset URL. Stream it to YouTube without buffering the whole file in RAM.
-    const upstream = await axios.get(item.secureUrl, { responseType: 'stream', timeout: 120000, maxRedirects: 5 });
+
+    // Get original media from Cloudinary
+    const upstream = await axios.get(item.secureUrl, {
+      responseType: 'stream',
+      timeout: 120000,
+      maxRedirects: 5
+    });
+
+    // Upload and schedule on YouTube
     const upload = await youtube.videos.insert({
       part: ['snippet', 'status'],
       requestBody: {
-        snippet: { title: item.title, description: item.description || '', categoryId: '22' },
-        status: { privacyStatus: 'private', publishAt: publishAt.toISOString(), selfDeclaredMadeForKids: false }
+        snippet: {
+          title: item.title,
+          description: item.description || '',
+          categoryId: '22'
+        },
+        status: {
+          privacyStatus: 'private',
+          publishAt: publishAt.toISOString(),
+          selfDeclaredMadeForKids: false
+        }
       },
-      media: { body: upstream.data }
+      media: {
+        body: upstream.data
+      }
     });
-    const videoId = upload.data.id;
-    if (!videoId) throw new Error('YouTube did not return a video ID. The source file was kept so you can retry safely.');
 
-    const youtubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
-    // Save the YouTube ID first. If cloud cleanup fails, the item remains in the library
-    // but cannot accidentally be uploaded a second time.
-    item.status = 'scheduled';
-    item.scheduledAt = publishAt;
+    const videoId = upload.data.id;
+
+    if (!videoId) {
+      throw new Error('YouTube did not return a video ID.');
+    }
+
+    const youtubeUrl =
+      `https://www.youtube.com/watch?v=${videoId}`;
+
+    // FIRST: Save YouTube details in MongoDB
     item.youtubeVideoId = videoId;
     item.youtubeUrl = youtubeUrl;
+    item.scheduledAt = publishAt;
+    item.status = 'scheduled';
     item.lastError = '';
+
     await item.save();
 
-    // After YouTube confirms the upload, remove the source video from Cloudinary and
-    // then remove its MongoDB record. If Cloudinary cleanup fails, retain the record
-    // so the user can see the YouTube URL and retry cleanup instead of losing track.
+    // SECOND: Delete original Cloudinary media
     try {
-      const deletion = await cloudinary.uploader.destroy(item.cloudinaryPublicId, {
-        resource_type: item.resourceType === 'video' ? 'video' : 'image',
-        invalidate: true
-      });
+      const deletion = await cloudinary.uploader.destroy(
+        item.cloudinaryPublicId,
+        {
+          resource_type: 'video',
+          invalidate: true
+        }
+      );
+
       if (!['ok', 'not found'].includes(deletion?.result)) {
-        throw new Error(`Cloudinary returned '${deletion?.result || 'unknown result'}'.`);
+        throw new Error(
+          `Cloudinary deletion failed: ${deletion?.result}`
+        );
       }
-      await item.deleteOne();
+
+      // THIRD: Retain MongoDB record, remove Cloudinary references
+      item.cloudinaryPublicId = null;
+      item.secureUrl = null;
+      item.cloudinaryDeleted = true;
+      item.lastError = '';
+
+      await item.save();
+
       return res.json({
         ok: true,
         cleanupComplete: true,
+        message: 'Video successfully scheduled and Cloudinary source deleted.',
         youtubeUrl,
-        message: 'Video uploaded and scheduled on YouTube. The source file was deleted from Cloudinary and its record was deleted from MongoDB.'
+        item
       });
+
     } catch (cleanupError) {
-      const cleanupMessage = `YouTube upload succeeded, but source cleanup failed: ${cleanupError.message}`;
-      item.lastError = cleanupMessage;
-      await item.save().catch(() => {});
+
+      // Keep the YouTube record if Cloudinary cleanup fails
+      item.cloudinaryDeleted = false;
+      item.lastError =
+        `YouTube upload succeeded, but Cloudinary cleanup failed: ${cleanupError.message}`;
+
+      await item.save();
+
       return res.json({
         ok: true,
         cleanupComplete: false,
+        message: item.lastError,
         youtubeUrl,
-        item,
-        message: `${cleanupMessage} The source remains in the library so you can retry cleanup. Do not upload it again.`
+        item
       });
     }
+
   } catch (error) {
-    const message = error.response?.data?.error?.message || error.message || 'YouTube upload failed.';
-    await Media.findByIdAndUpdate(req.params.id, { $set: { lastError: message, status: 'failed' } }).catch(() => {});
+    const message =
+      error.response?.data?.error?.message ||
+      error.message ||
+      'YouTube upload failed.';
+
+    await Media.findByIdAndUpdate(req.params.id, {
+      $set: { lastError: message }
+    }).catch(() => {});
+
     res.status(500).json({ error: message });
   }
 });
@@ -245,11 +332,4 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: 'Unexpected server error.' });
 });
 
-async function start() {
-  if (!process.env.MONGODB_URI) throw new Error('MONGODB_URI is missing. Copy .env.example to .env and configure it.');
-  await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 15000 });
-  console.log('Connected to MongoDB');
-  app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
-}
 
-start().catch(error => { console.error('Startup failed:', error.message); process.exit(1); });
