@@ -1,1 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "youtube-auth-server",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-11-12",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "observability": {
+    "enabled": true
+  }
+}
 
